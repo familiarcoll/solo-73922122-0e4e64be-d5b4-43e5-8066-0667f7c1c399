@@ -29,8 +29,20 @@ if another commit landed in between, it rolls back and re-plans from the
 freshly published structure, re-running the cycle check over the combined
 structure.  A stale plan can therefore neither overwrite newer structure,
 drop newly added dependencies, nor let two individually acyclic edits
-combine into a cycle.  Non-blocking lock attempts plus backoff keep two
-web processes from serialising behind one stale plan.
+combine into a cycle.
+
+The same rule applies when a *stale* plan fails its own checks: an overflow
+(or a cycle, or a capacity breach) computed from an outdated snapshot may
+simply reflect structure that another editor has already fixed.  Before
+reporting such a failure, the store re-checks the published sequence while
+holding the writer slot; if a newer version is out, the plan is discarded and
+the whole batch is re-validated and re-expanded against the fresh structure.
+Only a failure that also reproduces on the latest published structure is
+returned to the editor, and then nothing is written - the published version
+and its materialised usage rows stay exactly as they were.
+
+Non-blocking lock attempts plus backoff keep two web processes from
+serialising behind one stale plan.
 
 Version-based storage also makes reads and downloads trivially consistent:
 the API resolves the head once inside a single read transaction and only
@@ -683,6 +695,79 @@ class BomStore:
             time.sleep(min(0.005 * (2 ** attempt), 0.2) + jitter * attempt)
         raise ConflictError(f"并发修改过于频繁，请重试（{last_error}）")
 
+    def _plan(
+        self,
+        ops: Sequence[BatchOp],
+        base_seq: int,
+        base_edges: Sequence[Edge],
+        attempt: int,
+        pause_hook: Callable[[int, int], None] | None = None,
+    ) -> tuple[list[Edge], dict[tuple[str, str], int]]:
+        """Validate and expand the batch on the in-memory snapshot.
+
+        Runs without any write lock, so any error raised here describes only
+        the snapshot it was computed from - the caller must confirm it against
+        the published head before surfacing it (see ``_try_commit``).
+        """
+        # Demo-only pause: runs before every check, still outside any write
+        # transaction, so a second writer can land while this plan is being
+        # computed from an now-outdated snapshot.
+        if pause_hook is not None:
+            pause_hook(attempt, base_seq)
+
+        new_edges, _deleted = apply_ops(base_edges, ops)
+        validate_limits(new_edges)
+        cycles = find_cycles(new_edges)
+        if cycles:
+            raise CyclicStructureError(cycles)
+
+        # Pure computation on the snapshot: no write lock is held here.
+        usage = self.expand_all(new_edges)
+        return new_edges, usage
+
+    def _confirm_rejection(self, base_seq: int, exc: Exception) -> None:
+        """Report a plan failure only if it still holds for the published head.
+
+        Runs in a single ``BEGIN IMMEDIATE`` transaction: taking the writer
+        slot waits for any in-flight commit to finish, so the decision cannot
+        race with a commit landing right after the check.  If the published
+        sequence has moved, the plan was stale - ``None`` tells the caller to
+        re-read the fresh structure and redo validation + expansion.  If it
+        has not moved, the failure describes the latest published structure,
+        so it is raised *while still holding the write slot* (closing the
+        connection rolls back, leaving the published version untouched).
+
+        If the writer slot cannot be acquired the outcome is unknown; treat it
+        like a changed version and let the bounded retry loop re-plan.
+        """
+        conn = self._connect()
+        try:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as lock_exc:
+                if "locked" in str(lock_exc).lower() or "busy" in str(lock_exc).lower():
+                    return
+                raise
+            try:
+                changed = int(self._read_head(conn)["version_seq"]) != base_seq
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            if changed:
+                return
+            # Still holding the writer slot: nothing can commit between this
+            # check and the error below, so the rejection is final for the
+            # currently published structure and writes nothing.
+            if isinstance(exc, OverflowError):
+                raise ValidationError(f"用量溢出：{exc}") from None
+            raise exc
+        finally:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            conn.close()
+
     def _try_commit(
         self,
         ops: Sequence[BatchOp],
@@ -691,19 +776,20 @@ class BomStore:
         attempt: int = 0,
         pause_hook: Callable[[int, int], None] | None = None,
     ) -> CommitResult | None:
-        new_edges, _deleted = apply_ops(base_edges, ops)
-        validate_limits(new_edges)
-        cycles = find_cycles(new_edges)
-        if cycles:
-            raise CyclicStructureError(cycles)
-
-        # Pure computation on the snapshot: no write lock is held here.
-        if pause_hook is not None:
-            pause_hook(attempt, base_seq)
         try:
-            usage = self.expand_all(new_edges)
-        except OverflowError as exc:
-            raise ValidationError(f"用量溢出：{exc}") from None
+            new_edges, usage = self._plan(ops, base_seq, base_edges, attempt, pause_hook)
+        except (OverflowError, CyclicStructureError, CapacityError) as exc:
+            # A rejection computed from a stale snapshot does not describe
+            # today's published structure: another editor may already have
+            # fixed the very thing that failed (e.g. lowered a quantity so the
+            # expansion no longer overflows, or removed an edge that closed a
+            # cycle).  Confirm under the writer slot; if the published
+            # sequence moved, discard this plan (``None``) and redo the whole
+            # batch against the fresh structure.  Only a failure that still
+            # reproduces there is returned, and then nothing is written, so
+            # the published version and its usage rows stay intact.
+            self._confirm_rejection(base_seq, exc)
+            return None
 
         conn = self._connect()
         try:

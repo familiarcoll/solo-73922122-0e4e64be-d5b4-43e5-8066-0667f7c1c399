@@ -25,8 +25,9 @@ def test_template_ids_cover_all_script_references(tmp_path):
         html = client.get("/").text
         script = client.get("/static/app.js").text
     html_ids = _ids(html)
-    # $("...") lookups in the script.
-    referenced = set(re.findall(r'$\("([^"]+)"\)', script))
+    # $("...") lookups in the script ($ must be escaped: bare $ is end-of-line).
+    referenced = set(re.findall(r'\$\("([^"]+)"\)', script))
+    assert referenced, "no $(\"id\") references found - the check would be vacuous"
     missing = referenced - html_ids
     assert not missing, f"script references ids absent from the template: {sorted(missing)}"
 

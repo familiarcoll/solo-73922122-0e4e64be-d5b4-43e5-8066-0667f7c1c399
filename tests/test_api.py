@@ -214,6 +214,85 @@ def test_two_web_apps_interleaved_edits_combine_cycle_rejected(tmp_path):
         ], state["leaf_usage"]
 
 
+def test_stale_overflow_retry_is_not_a_false_rejection(tmp_path):
+    """Reported bug: a late batch is not rejected for overflow the latest version fixed.
+
+    A → B, B → C both 1e9.  A adds C → D(10) and pauses while expanding; B
+    lowers A → B to 1 and publishes first.  A's stale expansion overflows, but
+    the published structure does not, so A must re-plan and commit - not 422.
+    """
+    with _client(tmp_path, "alpha") as alpha, _client(tmp_path, "beta") as beta:
+        alpha.post(
+            "/api/batch",
+            json={"ops": _upsert_ops(("A", "B", 10 ** 9), ("B", "C", 10 ** 9))},
+        )
+        holder = {}
+
+        def slow_alpha():
+            holder["response"] = alpha.post(
+                "/api/batch",
+                json={"ops": _upsert_ops(("C", "D", 10))},
+                headers={"X-Demo-Pause": "1"},
+            )
+
+        handler = threading.Thread(target=slow_alpha)
+        handler.start()
+        time.sleep(0.2)
+        lowered = beta.post("/api/batch", json={"ops": _upsert_ops(("A", "B", 1))})
+        assert lowered.status_code == 200
+        lowered_version = lowered.json()["version_seq"]
+        handler.join(timeout=10)
+
+        response = holder["response"]
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert payload["retries"] >= 1
+        assert payload["version_seq"] > lowered_version
+        rows = beta.get("/api/leaf-usage").json()["rows"]
+        usage = {(r["top_part"], r["leaf_part"]): r["qty"] for r in rows}
+        assert usage[("A", "D")] == 10 ** 10
+        assert usage[("C", "D")] == 10
+
+
+def test_overflow_that_is_real_on_latest_version_rejects_batch_and_keeps_head(tmp_path):
+    """A genuinely overflowing batch is a 422 and leaves every committed version intact."""
+    with _client(tmp_path, "alpha") as alpha, _client(tmp_path, "beta") as beta:
+        alpha.post(
+            "/api/batch",
+            json={"ops": _upsert_ops(("A", "B", 10 ** 9), ("B", "C", 10 ** 9))},
+        )
+        holder = {}
+
+        def slow_alpha():
+            holder["response"] = alpha.post(
+                "/api/batch",
+                json={"ops": _upsert_ops(("C", "D", 10))},
+                headers={"X-Demo-Pause": "1"},
+            )
+
+        handler = threading.Thread(target=slow_alpha)
+        handler.start()
+        time.sleep(0.2)
+        # B commits an unrelated (non-fixing) batch first.
+        unrelated = beta.post("/api/batch", json={"ops": _upsert_ops(("P", "Q", 2))})
+        assert unrelated.status_code == 200
+        handler.join(timeout=10)
+
+        response = holder["response"]
+        assert response.status_code == 422, response.text
+        assert "用量溢出" in response.json()["error"]
+        state = beta.get("/api/state").json()
+        assert state["version"]["seq"] == unrelated.json()["version_seq"]
+        edges = {(e["parent"], e["child"]) for e in state["edges"]}
+        assert ("C", "D") not in edges and ("P", "Q") in edges
+        rows = {(r["top_part"], r["leaf_part"]): r["qty"] for r in state["leaf_usage"]}
+        assert rows == {
+            ("A", "C"): 10 ** 18,
+            ("B", "C"): 10 ** 9,
+            ("P", "Q"): 2,
+        }
+
+
 def test_stale_expansion_keeps_new_dependency(tmp_path):
     """B adds a new leaf under SA while A re-quantifies FG->SA."""
     with _client(tmp_path, "alpha") as alpha, _client(tmp_path, "beta") as beta:
@@ -344,3 +423,28 @@ def test_demo_seed_and_leaf_promotion(tmp_path):
         assert usage[("FG-1", "L-6")] == 12  # 2 * 2 * 3
         assert usage[("FG-1", "L-7")] == 4
         assert usage[("L-4", "L-6")] == 3
+
+
+def test_demo_overflow_endpoint_shows_successful_replan(tmp_path):
+    """The one-click demo: late batch is not falsely rejected for overflow."""
+    with _client(tmp_path, "demo") as demo:
+        response = demo.post("/api/demo/overflow/run")
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert payload["a_retries"] >= 1
+        assert payload["a_version_seq"] > payload["b_version_seq"] > payload["setup_version_seq"]
+        usage = {(r["top_part"], r["leaf_part"]): r["qty"] for r in payload["a_side_usage"]}
+        assert usage[("OV-A", "OV-D")] == 10 ** 10
+        assert ("OV-A", "OV-D") in usage
+        # Only the A-side rows are returned by the filter; the full state has
+        # the published structure with the lowered quantity.
+        state = demo.get("/api/state").json()
+        edges = {(e["parent"], e["child"]): e["qty"] for e in state["edges"]}
+        assert edges[("OV-A", "OV-B")] == 1
+        assert edges[("OV-C", "OV-D")] == 10
+        assert state["version"]["seq"] == payload["a_version_seq"]
+
+
+def test_demo_overflow_endpoint_requires_demo_mode(tmp_path):
+    with _client(tmp_path, "plain", demo=False) as plain:
+        assert plain.post("/api/demo/overflow/run").status_code == 404

@@ -7,6 +7,7 @@ several independent web processes against the same SQLite file.
 from __future__ import annotations
 
 import os
+import threading
 import time
 from contextlib import asynccontextmanager
 from typing import Any, Callable, Mapping
@@ -16,10 +17,19 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .demo import DEMO_EDGES, INTERLEAVE_A, INTERLEAVE_B, PROMOTE_LEAF_OPS
+from .demo import (
+    DEMO_EDGES,
+    INTERLEAVE_A,
+    INTERLEAVE_B,
+    OVERFLOW_A,
+    OVERFLOW_B,
+    OVERFLOW_EDGES,
+    PROMOTE_LEAF_OPS,
+)
 from .store import (
     MAX_EDGES,
     MAX_PARTS,
+    BatchOp,
     BomError,
     BomStore,
     CommitResult,
@@ -218,6 +228,63 @@ def create_app(
             "reused": result.reused,
         }
 
+    @app.post("/api/demo/overflow/run")
+    def demo_overflow_run() -> dict[str, Any]:
+        """Reproduce the "用量溢出误拒" sample in one click.
+
+        Resets the OV-* sub-graph to A→B(1e9), B→C(1e9), then lets the two
+        writers interleave: a pause hook stands in for a slow expansion while
+        the other writer lowers A→B to 1 and publishes first.  The late batch
+        must **not** be rejected for overflow - it re-plans on the published
+        structure and commits.  Returns both versions so the UI can show the
+        retry (``retries >= 1``) and the final leaf usage.
+        """
+        if not demo_enabled:
+            raise NotFoundError("演示数据未启用")
+        setup = active_store.commit_batch(
+            [
+                BatchOp("upsert", upserts=(edge,)) for edge in OVERFLOW_EDGES
+            ]
+            + [BatchOp("delete", parent="OV-C", child="OV-D")]
+        )
+        result: dict[str, Any] = {}
+        b_started = threading.Event()
+        b_done = threading.Event()
+
+        def writer_b() -> None:
+            # The "other process": publishes the lowered quantity first.
+            try:
+                b_started.wait(5)
+                result["b"] = active_store.commit_batch(OVERFLOW_B)
+            except Exception as exc:  # pragma: no cover - diagnostics
+                result["b_error"] = str(exc)
+            finally:
+                b_done.set()
+
+        thread = threading.Thread(target=writer_b, daemon=True)
+        thread.start()
+
+        def pause(attempt: int, _base_seq: int) -> None:
+            if attempt == 0:
+                b_started.set()
+                if not b_done.wait(5):  # pragma: no cover - defensive
+                    raise BomError("演示进程等待超时")
+
+        a_result = active_store.commit_batch(OVERFLOW_A, pause_hook=pause)
+        thread.join(timeout=10)
+        if "b_error" in result:
+            raise BomError(f"B 侧提交失败：{result['b_error']}")
+        head, rows = active_store.usage_rows(top="OV-A")
+        return {
+            "setup_version_seq": setup.version_seq,
+            "b_version_seq": result["b"].version_id,
+            "a_version_seq": a_result.version_id,
+            "a_retries": a_result.retries,
+            "version_seq": a_result.version_id,
+            "leaf_rows": a_result.leaf_rows,
+            "a_side_usage": rows,
+        }
+
     @app.get("/api/demo/scenarios")
     def demo_scenarios() -> dict[str, Any]:
         """Describe the bundled interleaving sample so the UI can offer it."""
@@ -237,6 +304,13 @@ def create_app(
             "interleaving_cycle": {
                 "description": "A 加 FG-9→NEW-1，B 加 NEW-1→FG-9；单独无环，交错后成环",
                 "endpoint": "/api/demo/interleave/a|b",
+            },
+            "stale_overflow": {
+                "description": (
+                    "A→B、B→C 各 1e9；迟到的 C→D(10) 在旧快照上溢出，"
+                    "但另一进程已先把 A→B 改为 1 并发布；迟到的批改按最新结构重算后成功"
+                ),
+                "endpoint": "/api/demo/overflow/run",
             },
         }
 

@@ -367,6 +367,148 @@ def test_late_expansion_cannot_overwrite_newer_structure(tmp_path):
     assert result.retries >= 1
 
 
+# -- stale-snapshot rejections ("扣除误拒") --------------------------------
+#
+# A batch planned on an old snapshot can fail its own checks (overflow, cycle,
+# capacity) even though the *published* structure has meanwhile been fixed by
+# another commit.  Such a rejection must never be reported as final: the store
+# has to notice the sequence moved and redo the whole validation + expansion
+# against the latest published structure.  Only a failure that reproduces
+# there is a real rejection, and then the published version is kept untouched.
+
+
+def _huge_chain():
+    # A -> B(1e9) ; B -> C(1e9) => A's C usage is 1e18, still below 2**63-1.
+    return _ops([Edge("A", "B", 10 ** 9), Edge("B", "C", 10 ** 9)])
+
+
+def test_stale_overflow_is_replanned_against_latest_structure(tmp_path):
+    """The reported demo: a late batch is rejected for overflow, then retried.
+
+    A adds C -> D(10) and pauses inside its expansion; B lowers A -> B to 1 and
+    publishes first.  A's stale plan (A->B=1e9) overflows, but the published
+    structure no longer does.  A must therefore re-plan on B's version and
+    commit instead of surfacing a spurious "用量溢出".
+    """
+    path = str(tmp_path / "stale-overflow.db")
+    store_a = BomStore(path)
+    store_b = BomStore(path)
+    store_a.commit_batch(_huge_chain())
+    observed = {}
+
+    def pause(attempt, _base_seq):
+        if attempt == 0:
+            observed["b"] = store_b.commit_batch(
+                _ops([Edge("A", "B", 1)]),  # drops the overflowing multiplier
+            )
+
+    result = store_a.commit_batch(
+        _ops([Edge("C", "D", 10)]), pause_hook=pause
+    )
+    assert result.retries >= 1
+    assert result.version_id > observed["b"].version_id
+    edges = {(e["parent"], e["child"]): e["qty"] for e in store_a.snapshot()["edges"]}
+    assert edges[("A", "B")] == 1
+    assert edges[("C", "D")] == 10
+    usage = _usage(store_a)
+    # Fresh structure: A -> B is 1, B -> C is 1e9, C -> D is 10 => 1e10.
+    # (The stale plan would have been 1e9 * 1e9 * 10, well past 2**63-1.)
+    assert usage[("A", "D")] == 10 ** 10
+    assert usage[("B", "D")] == 10 ** 10
+    assert usage[("C", "D")] == 10
+
+
+def test_stale_cycle_is_replanned_when_latest_structure_is_acyclic(tmp_path):
+    """A stale plan can also invent a cycle that the published head no longer has."""
+    path = str(tmp_path / "stale-cycle.db")
+    store_a = BomStore(path)
+    store_b = BomStore(path)
+    store_a.commit_batch(_ops([Edge("X", "Y", 1), Edge("Y", "Z", 1)]))
+    observed = {}
+
+    def pause(attempt, _base_seq):
+        if attempt == 0:
+            # Remove the edge that would close A's new loop X -> Y -> Z -> X.
+            observed["b"] = store_b.commit_batch(
+                [BatchOp("delete", parent="X", child="Y")]
+            )
+
+    # Against the *old* snapshot Z -> X closes X -> Y -> Z -> X.
+    result = store_a.commit_batch(_ops([Edge("Z", "X", 1)]), pause_hook=pause)
+    assert result.retries >= 1
+    assert result.version_id > observed["b"].version_id
+    edges = {(e["parent"], e["child"]) for e in store_a.snapshot()["edges"]}
+    assert ("Z", "X") in edges and ("X", "Y") not in edges
+    assert find_cycles([Edge(p, c, 1) for p, c in edges]) == []
+
+
+def test_stale_capacity_error_is_replanned_when_latest_has_room(tmp_path):
+    """Capacity is judged on the latest structure too, not on a stale snapshot."""
+    path = str(tmp_path / "stale-capacity.db")
+    store_a = BomStore(path)
+    store_b = BomStore(path)
+    # 199 edges, leaving room for exactly one more.
+    parts = [f"N{i}" for i in range(100)]
+    base = _dense_acyclic_structure(parts, target=199)
+    store_a.commit_batch(_ops([Edge(a, b, 1) for a, b in base]))
+    observed = {}
+
+    def pause(attempt, _base_seq):
+        if attempt == 0:
+            # Free a slot by deleting one edge, then the batch fits again.
+            observed["b"] = store_b.commit_batch(
+                [BatchOp("delete", parent=base[0][0], child=base[0][1])]
+            )
+
+    result = store_a.commit_batch(_ops([Edge("ZZ", "N0", 1)]), pause_hook=pause)
+    assert result.retries >= 1
+    assert result.version_id > observed["b"].version_id
+    edges = {(e["parent"], e["child"]) for e in store_a.snapshot()["edges"]}
+    assert ("ZZ", "N0") in edges
+    assert base[0] not in edges
+
+
+def test_overflow_on_latest_structure_is_rejected_and_published_version_kept(tmp_path):
+    """If the latest published structure still overflows, the batch fails whole."""
+    path = str(tmp_path / "real-overflow.db")
+    store_a = BomStore(path)
+    store_b = BomStore(path)
+    store_a.commit_batch(_huge_chain())
+    observed = {}
+
+    def pause(attempt, _base_seq):
+        if attempt == 0:
+            # B commits something unrelated; the overflow is still real.
+            observed["b"] = store_b.commit_batch(_ops([Edge("P", "Q", 2)]))
+
+    before_version = store_a.snapshot()["version"]["version_seq"]
+    with pytest.raises(ValidationError) as info:
+        store_a.commit_batch(_ops([Edge("C", "D", 10)]), pause_hook=pause)
+    assert "用量溢出" in str(info.value)
+    # B's commit survives; A's batch wrote nothing.
+    state = store_a.snapshot()
+    edges = {(e["parent"], e["child"]) for e in state["edges"]}
+    assert ("C", "D") not in edges and ("P", "Q") in edges
+    assert state["version"]["version_seq"] == observed["b"].version_id
+    assert state["version"]["version_seq"] != before_version
+    # Materialised usage matches the published structure, unchanged by A.
+    usage = _usage(store_a)
+    assert usage[("P", "Q")] == 2
+    assert ("A", "D") not in usage
+
+
+def test_overflow_with_no_concurrent_commit_reports_immediately(tmp_path):
+    """Without a new published version there is nothing to re-plan: fail fast."""
+    path = str(tmp_path / "plain-overflow.db")
+    store = BomStore(path)
+    store.commit_batch(_huge_chain())
+    before = store.snapshot()
+    with pytest.raises(ValidationError) as info:
+        store.commit_batch(_ops([Edge("C", "D", 10)]))
+    assert "用量溢出" in str(info.value)
+    assert store.snapshot() == before
+
+
 def test_two_acyclic_edits_cannot_combine_into_cycle(tmp_path):
     """Writer B commits A->Z, Z->FG while A expands FG->A.
 

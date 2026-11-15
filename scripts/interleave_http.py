@@ -1,6 +1,6 @@
 """Interleave edits across the two compose web containers.
 
-    docker compose --profile demos run --rm interleave
+    docker compose --profile demo run --rm interleave
 
 Uses only HTTP, so it works from inside the compose network.
 """
@@ -94,7 +94,35 @@ def main() -> None:
     check("A's edit rejected with a cycle path", status_a == 409 and body_a.get("paths"),
           str(body_a)[:160])
 
-    # 3) Downloads on both processes show exactly one version.
+    # 3) A stale overflow is re-planned, not falsely rejected.  A -> B and
+    # B -> C are 1e9; adding C -> D(10) overflows on that snapshot, but B
+    # lowers A -> B to 1 and publishes first, so A must succeed after retry.
+    status, body = call(A, "POST", "/api/batch", {"ops": [
+        upsert("OV-A", "OV-B", 10 ** 9),
+        upsert("OV-B", "OV-C", 10 ** 9),
+    ]})
+    check("overflow sample structure set", status == 200, str(body)[:120])
+    result = {}
+
+    def slow_a3():
+        result["a3"] = batch(A, [upsert("OV-C", "OV-D", 10)], pause=1.5)
+
+    thread = threading.Thread(target=slow_a3)
+    thread.start()
+    time.sleep(0.3)
+    status_b, body_b = batch(B, [upsert("OV-A", "OV-B", 1)])
+    thread.join(timeout=30)
+    status_a, body_a = result["a3"]
+    check("B published the lowered quantity", status_b == 200, str(body_b)[:120])
+    check("A was not falsely rejected for overflow", status_a == 200, str(body_a)[:160])
+    check("A re-planned on the published structure", body_a.get("retries", 0) >= 1,
+          str(body_a)[:160])
+    _, usage = call(A, "GET", "/api/leaf-usage")
+    rows = {(r["top_part"], r["leaf_part"]): r["qty"] for r in usage["rows"]}
+    check("fresh expansion stored", rows.get(("OV-A", "OV-D")) == 10 ** 10,
+          str(rows.get(("OV-A", "OV-D"))))
+
+    # 4) Downloads on both processes show exactly one version.
     for base in (A, B):
         request = urllib.request.Request(base + "/api/leaf-usage.csv")
         with urllib.request.urlopen(request, timeout=10) as response:

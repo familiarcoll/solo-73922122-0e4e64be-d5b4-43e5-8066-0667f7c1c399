@@ -10,8 +10,11 @@ one writer and proves:
 
 1. the other process can commit while the first is expanding (no write lock);
 2. a late expansion is re-planned, so a dependency added meanwhile is kept;
-3. two individually acyclic edits that combine into a cycle are rejected;
-4. every read/download is a single database snapshot.
+3. a stale overflow is re-checked against the published version and then
+   re-planned, so a batch another editor has already fixed is not falsely
+   rejected (and a batch that still overflows is rejected whole);
+4. two individually acyclic edits that combine into a cycle are rejected;
+5. every read/download is a single database snapshot.
 """
 
 from __future__ import annotations
@@ -152,8 +155,69 @@ def scenario_no_lock_and_replan(alpha: Web, beta: Web) -> None:
     check("alpha re-planned rather than overwriting", retries >= 1, f"retries={retries}")
 
 
+def scenario_stale_overflow(alpha: Web, beta: Web) -> None:
+    print("\n2) A stale overflow is not a false rejection: it is re-planned")
+    # OV-A -> OV-B(1e9) -> OV-C(1e9): adding OV-C -> OV-D(10) overflows.
+    alpha.post(
+        "/api/batch",
+        {
+            "ops": [
+                {"op": "upsert", "parent": "OV-A", "child": "OV-B", "qty": 10 ** 9},
+                {"op": "upsert", "parent": "OV-B", "child": "OV-C", "qty": 10 ** 9},
+            ]
+        },
+    )
+    holder = {}
+
+    def slow_writer():
+        holder["response"] = alpha.post(
+            "/api/batch",
+            ops(("OV-C", "OV-D", 10)),
+            headers={"X-Demo-Pause": "1.5"},
+        )
+
+    thread = threading.Thread(target=slow_writer)
+    thread.start()
+    time.sleep(0.3)
+    status_b, body_b = beta.post("/api/batch", ops(("OV-A", "OV-B", 1)))
+    thread.join(timeout=30)
+    check("beta published the lowered quantity", status_b == 200, body_b[:160])
+    status_a, body_a = holder["response"]
+    check("alpha was not falsely rejected for overflow", status_a == 200, body_a[:200])
+    payload = json.loads(body_a)
+    check("alpha re-planned on the published structure", payload.get("retries", 0) >= 1,
+          str(payload))
+    rows = json.loads(alpha.get("/api/leaf-usage")[1])["rows"]
+    usage = {(r["top_part"], r["leaf_part"]): r["qty"] for r in rows}
+    check("fresh structure's expansion was stored", usage.get(("OV-A", "OV-D")) == 10 ** 10,
+          str(usage.get(("OV-A", "OV-D"))))
+
+    # Now make the overflow real: drop the third hop and restore the 1e9
+    # multiplier in one batch (that structure itself is safe), then add the
+    # new hop again.  The batch must fail whole while the published version
+    # (with beta's edit) stays intact.
+    status, body = alpha.post(
+        "/api/batch",
+        {
+            "ops": [
+                {"op": "delete", "parent": "OV-C", "child": "OV-D"},
+                {"op": "upsert", "parent": "OV-A", "child": "OV-B", "qty": 10 ** 9},
+            ]
+        },
+    )
+    check("restored the overflowing multiplier", status == 200, body[:160])
+    status, body = alpha.post("/api/batch", ops(("OV-C", "OV-D", 10)))
+    parsed = json.loads(body)
+    check("real overflow on the latest structure rejected",
+          status == 422 and "用量溢出" in parsed.get("error", ""), body[:200])
+    state = json.loads(alpha.get("/api/state")[1])
+    edges = {(e["parent"], e["child"]) for e in state["edges"]}
+    check("published structure kept (no partial write)", ("OV-C", "OV-D") not in edges,
+          str(sorted(edges)))
+
+
 def scenario_composed_cycle(alpha: Web, beta: Web) -> None:
-    print("\n2) Two individually acyclic edits cannot combine into a cycle")
+    print("\n3) Two individually acyclic edits cannot combine into a cycle")
     alpha.post("/api/batch", ops(("BASE", "FG2", 1)))
     holder = {}
 
@@ -181,7 +245,7 @@ def scenario_composed_cycle(alpha: Web, beta: Web) -> None:
 
 
 def scenario_snapshot_reads(alpha: Web, beta: Web) -> None:
-    print("\n3) Concurrent reads/downloads never mix two commits")
+    print("\n4) Concurrent reads/downloads never mix two commits")
     beta.post("/api/batch", ops(("M", "N", 1), ("N", "P", 1)))
     stop = threading.Event()
     failures = []
@@ -221,7 +285,7 @@ def scenario_snapshot_reads(alpha: Web, beta: Web) -> None:
 
 
 def scenario_restart(alpha: Web, beta: Web, db_path: str, tmp: str) -> None:
-    print("\n4) Results survive a restart; the restarted process reads no re-expansion")
+    print("\n5) Results survive a restart; the restarted process reads no re-expansion")
     status, body = alpha.get("/api/state")
     version = json.loads(body)["version"]["seq"]
     usage_before = json.loads(alpha.get("/api/leaf-usage")[1])["rows"]
@@ -248,6 +312,7 @@ def main() -> None:
         try:
             print(f"alpha={alpha.port} beta={beta.port} db={db_path}")
             scenario_no_lock_and_replan(alpha, beta)
+            scenario_stale_overflow(alpha, beta)
             scenario_composed_cycle(alpha, beta)
             scenario_snapshot_reads(alpha, beta)
             scenario_restart(alpha, beta, db_path, tmp)

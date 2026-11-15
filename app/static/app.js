@@ -285,6 +285,31 @@
     }
   }
 
+  async function runOverflowDemo() {
+    const note = $("demo-result");
+    note.textContent = "溢出误拒样例：A 侧迟到的批改正在重算…";
+    try {
+      const data = await api("POST", "/api/demo/overflow/run", {});
+      const usage = (data.a_side_usage || [])
+        .map((row) => `${row.top_part} → ${row.leaf_part} = ${row.qty}`)
+        .join("，");
+      note.textContent =
+        `溢出误拒样例：B 侧先发布 v${data.b_version_seq}，` +
+        `A 侧重试 ${data.a_retries} 次后在最新结构上提交为 v${data.a_version_seq}` +
+        `（未误报溢出）。OV-A 叶件用量：${usage}`;
+      showCycles(null);
+      showAlert(
+        `迟到的批改未被误拒：旧快照溢出，但重算后按已发布结构成功提交 v${data.a_version_seq}。`,
+        "ok"
+      );
+      await refresh();
+    } catch (error) {
+      note.textContent = `溢出误拒样例失败：${error.message}`;
+      if (error.paths) showCycles(error.paths);
+      else showAlert(error.message, "err");
+    }
+  }
+
   function bind() {
     $("btn-stage-upsert").addEventListener("click", () => stage("upsert"));
     $("btn-stage-delete").addEventListener("click", () => stage("delete"));
@@ -302,6 +327,7 @@
       demoAction("写 A 侧", "/api/demo/interleave/a", Number($("demo-pause").value || 0)));
     $("btn-interleave-b").addEventListener("click", () =>
       demoAction("写 B 侧", "/api/demo/interleave/b", 0));
+    $("btn-overflow-demo").addEventListener("click", runOverflowDemo);
     $("f-qty").addEventListener("keydown", (event) => {
       if (event.key === "Enter") stage("upsert");
     });

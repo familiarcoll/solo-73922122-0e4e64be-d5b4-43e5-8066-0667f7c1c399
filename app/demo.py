@@ -33,6 +33,22 @@ INTERLEAVE_B = [
     BatchOp("upsert", upserts=(Edge("NEW-1", "FG-9", 1),)),
 ]
 
+# Stale-overflow sample ("用量溢出误拒"): both hops are 1e9, so adding a third
+# hop of 10 makes a top-level expansion exceed 2**63-1.  Writer A adds
+# OV-C -> OV-D(10) and pauses while expanding; writer B lowers OV-A -> OV-B to
+# 1 and publishes first.  A's stale plan overflows, but the published
+# structure does not, so A must re-plan against it and commit.
+OVERFLOW_EDGES = [
+    Edge("OV-A", "OV-B", 10 ** 9),
+    Edge("OV-B", "OV-C", 10 ** 9),
+]
+OVERFLOW_A = [
+    BatchOp("upsert", upserts=(Edge("OV-C", "OV-D", 10),)),
+]
+OVERFLOW_B = [
+    BatchOp("upsert", upserts=(Edge("OV-A", "OV-B", 1),)),
+]
+
 
 def seed_demo(store: BomStore) -> bool:
     """Load the demo structure only if the warehouse has never been populated."""
